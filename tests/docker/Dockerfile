@@ -153,6 +153,32 @@ RUN useradd -u $UID -ms /bin/bash ducker \
   && echo 'PATH=$PATH:'"$JAVA_HOME/bin" >> /home/ducker/.profile \
   && echo 'ducker ALL=(ALL) NOPASSWD: ALL' >> /etc/sudoers
 
+# Install librdkafka
+ARG LIBRDKAFKA_VERSION="2.10.1"
+COPY e2e_latency.c /usr/src/e2e_latency.c
+RUN apt-get update && apt-get install -y \
+    gcc g++ make pkg-config \
+    libssl-dev zlib1g-dev libzstd-dev \
+    libsasl2-dev libsasl2-modules libsasl2-modules-gssapi-mit \
+    krb5-user \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/* \
+    && echo "krb5-config krb5-config/default_realm string EXAMPLE.COM" > /tmp/krb5-debconf \
+    && debconf-set-selections /tmp/krb5-debconf \
+    && mkdir -p /tmp/librdkafka-build && cd /tmp/librdkafka-build \
+    && curl -L "https://github.com/edenhill/librdkafka/archive/v${LIBRDKAFKA_VERSION}.tar.gz" | tar xz --strip-components=1 \
+    && CFLAGS="-O3 -march=native -flto -Wno-free-nonheap-object" \
+       CXXFLAGS="-O3 -march=native -flto -Wno-non-virtual-dtor" \
+       LDFLAGS="-flto" ./configure --prefix=/usr \
+    && make -j$(nproc) && make install \
+    && cd examples && make \
+    && cp rdkafka_performance /usr/local/bin/ \
+    && cd /usr/src \
+    && gcc -o /usr/local/bin/e2e_latency e2e_latency.c -lrdkafka \
+    && mkdir -p /mnt/rdkafka && chmod 777 /mnt/rdkafka \
+    && ldconfig \
+    && rm -rf /tmp/librdkafka-build /tmp/krb5-debconf
+
 USER ducker
 
 CMD sudo service ssh start && tail -f /dev/null

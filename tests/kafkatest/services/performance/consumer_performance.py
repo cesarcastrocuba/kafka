@@ -144,5 +144,6 @@ class ConsumerPerformanceService(PerformanceService):
             self.results[idx-1] = {
                 'total_mb': float(parts[2]),
                 'mbps': float(parts[3]),
+                'records': int(parts[4]),
                 'records_per_sec': float(parts[5]),
             }

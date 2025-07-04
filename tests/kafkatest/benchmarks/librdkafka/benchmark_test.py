@@ -17,48 +17,39 @@ from ducktape.mark import matrix
 from ducktape.mark import parametrize
 from ducktape.mark.resource import cluster
 from ducktape.services.service import Service
-from ducktape.tests.test import Test
 
 from kafkatest.services.kafka import KafkaService, quorum
-from kafkatest.services.performance import ProducerPerformanceService, EndToEndLatencyService, ConsumerPerformanceService, throughput, latency, compute_aggregate_throughput
+from kafkatest.services.performance import throughput, latency, compute_aggregate_throughput
 from kafkatest.version import DEV_BRANCH, KafkaVersion
+from kafkatest.benchmarks.core.benchmark_test import Benchmark
 
-TOPIC_REP_ONE = "topic-replication-factor-one"
-TOPIC_REP_THREE = "topic-replication-factor-three"
+from kafkatest.benchmarks.librdkafka.producer_consumer_performance import LibrdKafkaProducerConsumerPerformance
+from kafkatest.benchmarks.librdkafka.end_to_end_latency import LibrdKafkaEndToEndLatency
+from kafkatest.benchmarks.librdkafka.setup_utils import setup_librdkafka, configure_security_settings
+
+# Reuse the same topic names from the original benchmark
+from kafkatest.benchmarks.core.benchmark_test import TOPIC_REP_ONE, TOPIC_REP_THREE
 DEFAULT_RECORD_SIZE = 100  # bytes
 
-
-class Benchmark(Test):
-    """A benchmark of Kafka producer/consumer performance. This replicates the test
-    run here:
-    https://engineering.linkedin.com/kafka/benchmarking-apache-kafka-2-million-writes-second-three-cheap-machines
+class LibrdkafkaBenchmark(Benchmark):
+    """A benchmark of librdkafka producer/consumer performance. This replicates the test
+    run for Java clients but using librdkafka instead.
+    
+    This class inherits from KafkaPerformanceTest to reuse common configuration and setup.
     """
     def __init__(self, test_context):
-        super(Benchmark, self).__init__(test_context)
-        self.num_brokers = 3
-        self.topics = {
-            TOPIC_REP_ONE: {'partitions': 6, 'replication-factor': 1},
-            TOPIC_REP_THREE: {'partitions': 6, 'replication-factor': 3}
-        }
+        # Call the parent class constructor to initialize common variables
+        super(LibrdkafkaBenchmark, self).__init__(test_context)
+        self.logger.info("Installing librdkafka on all nodes")
+        nodes = self.test_context.cluster.nodes
+        success = setup_librdkafka(nodes)
+        if not success:
+            raise RuntimeError("Failed to install librdkafka on one or more nodes")        
 
-        self.msgs_large = 10000000
-        self.batch_size = 8*1024
-        self.buffer_memory = 64*1024*1024
-        self.msg_sizes = [10, 100, 1000, 10000, 100000]
-        self.target_data_size = 128*1024*1024
-        self.target_data_size_gb = self.target_data_size/float(1024*1024*1024)
-
-        self.execution_id = 1
-
-    def start_kafka(self, security_protocol, interbroker_security_protocol, version, tls_version=None):
-        self.kafka = KafkaService(
-            self.test_context, self.num_brokers,
-            zk=None, security_protocol=security_protocol,
-            interbroker_security_protocol=interbroker_security_protocol, topics=self.topics,
-            version=version, tls_version=tls_version)
-        self.kafka.log_level = "INFO"  # We don't DEBUG logging here
-        self.kafka.start()
-
+    @cluster(num_nodes=13)
+    def test_load_librdkafka(self):
+        self.logger.info("Load Librdkafka in nodes")
+        
     @cluster(num_nodes=9)
     @parametrize(acks=1, topic=TOPIC_REP_ONE, metadata_quorum=quorum.isolated_kraft)
     @parametrize(acks=1, topic=TOPIC_REP_THREE, metadata_quorum=quorum.isolated_kraft)
@@ -77,23 +68,42 @@ class Benchmark(Test):
         security protocol and message size are varied depending on arguments injected into this test.
 
         Collect and return aggregate throughput statistics after all messages have been acknowledged.
-        (This runs ProducerPerformance.java under the hood)
+        (This uses rdkafka_performance instead of ProducerPerformance.java)
         """
         client_version = KafkaVersion(client_version)
         broker_version = KafkaVersion(broker_version)
         self.validate_versions(client_version, broker_version)
         self.start_kafka(security_protocol, security_protocol, broker_version, tls_version)
+
+        # Set up the cluster with librdkafka and tools
+        self.logger.info("Setting up cluster with librdkafka and tools")
+
         # Always generate the same total amount of data
         nrecords = int(self.target_data_size / message_size)
+      
+        # Convert acks to librdkafka format
+        rdkafka_acks = "all" if acks == -1 else str(acks)
+        
+        # Prepare settings for librdkafka
+        settings = {
+            'request.required.acks': rdkafka_acks,
+            'compression.type': compression_type,
+            'batch.size': self.batch_size,
+            'queue.buffering.max.kbytes': self.buffer_memory // 1024,  # Convert to KB
+            'queue.buffering.max.messages':1000000, 
+            'queue.buffering.max.ms':0,
+            'message.timeout.ms':120000,
+        }
+        
+        # Add security settings if needed
+        security_settings = configure_security_settings(security_protocol, tls_version)
+        settings.update(security_settings)
 
-        self.producer = ProducerPerformanceService(
+        self.producer = LibrdKafkaProducerConsumerPerformance(
             self.test_context, num_producers, self.kafka, topic=topic,
-            num_records=nrecords, record_size=message_size,  throughput=-1, version=client_version,
-            settings={
-                'acks': acks,
-                'compression.type': compression_type,
-                'batch.size': self.batch_size,
-                'buffer.memory': self.buffer_memory})
+            num_records=nrecords, record_size=message_size, throughput=-1,
+            mode="producer", version=client_version, settings=settings)
+        
         self.producer.run()
         return compute_aggregate_throughput(self.producer, self.execution_id)
 
@@ -111,7 +121,7 @@ class Benchmark(Test):
 
         Collect and return aggregate throughput statistics after all messages have been acknowledged.
 
-        (This runs ProducerPerformance.java under the hood)
+        (This uses rdkafka_performance instead of ProducerPerformance.java)
         """
         client_version = KafkaVersion(client_version)
         broker_version = KafkaVersion(broker_version)
@@ -119,22 +129,32 @@ class Benchmark(Test):
         if interbroker_security_protocol is None:
             interbroker_security_protocol = security_protocol
         self.start_kafka(security_protocol, interbroker_security_protocol, broker_version, tls_version)
-        self.producer = ProducerPerformanceService(
+        
+        # Prepare settings for librdkafka
+        settings = {
+            'request.required.acks': '1',
+            'compression.type': compression_type,
+            'batch.size': self.batch_size,
+            'queue.buffering.max.kbytes': self.buffer_memory // 1024,  # Convert to KB
+            'queue.buffering.max.messages':1000000, 
+            'queue.buffering.max.ms':0,
+            'message.timeout.ms':120000,
+        }
+        
+        # Add security settings if needed
+        security_settings = configure_security_settings(security_protocol, tls_version)
+        settings.update(security_settings)
+        
+        self.producer = LibrdKafkaProducerConsumerPerformance(
             self.test_context, 1, self.kafka,
             topic=TOPIC_REP_THREE, num_records=self.msgs_large, record_size=DEFAULT_RECORD_SIZE,
-            throughput=-1, version=client_version, settings={
-                'acks': 1,
-                'compression.type': compression_type,
-                'batch.size': self.batch_size,
-                'buffer.memory': self.buffer_memory
-            },
-            intermediate_stats=True
+            throughput=-1, mode="producer", version=client_version, settings=settings, intermediate_stats=True
         )
+        
         self.producer.run()
 
         summary = ["Throughput over long run, data > memory:"]
         data = {}
-        # FIXME we should be generating a graph too
         # Try to break it into 5 blocks, but fall back to a smaller number if
         # there aren't even 5 elements
         block_size = max(len(self.producer.stats[0]) // 5, 1)
@@ -148,8 +168,8 @@ class Benchmark(Test):
             else:
                 records_per_sec = sum([stat['records_per_sec'] for stat in subset])/float(len(subset))
                 mb_per_sec = sum([stat['mbps'] for stat in subset])/float(len(subset))
-                records = sum([stat['records'] for stat in subset])
-                duration_ms = records / records_per_sec * 1000
+                records = sum(stat.get('records', 0) for stat in subset)
+                duration_ms = sum(stat.get('duration_ms', 0) for stat in subset)
 
                 summary.append(" Time block %d: %f rec/sec (%f MB/s)" % (i, records_per_sec, mb_per_sec))
                 data[i] = throughput(records_per_sec, mb_per_sec, records, duration_ms,
@@ -173,7 +193,7 @@ class Benchmark(Test):
 
         Return aggregate latency statistics.
 
-        (Under the hood, this simply runs EndToEndLatency.java)
+        (This uses our C implementation instead of EndToEndLatency.java)
         """
         client_version = KafkaVersion(client_version)
         broker_version = KafkaVersion(broker_version)
@@ -182,15 +202,38 @@ class Benchmark(Test):
             interbroker_security_protocol = security_protocol
         self.start_kafka(security_protocol, interbroker_security_protocol, broker_version, tls_version)
         self.logger.info("BENCHMARK: End to end latency")
-        self.perf = EndToEndLatencyService(
+        
+        # Prepare settings for librdkafka
+        settings = {
+            'request.required.acks': '1',
+            'compression.type': compression_type,
+            'batch.size': 1,  # Small batch size to measure latency
+            'queue.buffering.max.kbytes': self.buffer_memory // 1024,  # Convert to KB
+            'queue.buffering.max.messages':1000000, 
+            'queue.buffering.max.ms':0,
+            'message.timeout.ms':120000,
+            'retries': 0,  # Avoid retry delays for latency testing
+
+            'auto.offset.reset': 'latest',
+            'group.id': 'test-consumer-group',
+        }
+        
+        # Add security settings if needed
+        security_settings = configure_security_settings(security_protocol, tls_version)
+        settings.update(security_settings)
+
+        self.perf = LibrdKafkaEndToEndLatency(
             self.test_context, 1, self.kafka,
-            topic=TOPIC_REP_THREE, num_records=10000,
-            compression_type=compression_type, version=client_version
+            topic=TOPIC_REP_THREE, num_records=10000, version=client_version,
+            settings=settings
         )
+        
         self.perf.run()
-        return latency(self.perf.results[0]['latency_50th_ms'],  self.perf.results[0]['latency_99th_ms'], self.perf.results[0]['latency_999th_ms'],
-                       self.execution_id)    
-    
+        return latency(self.perf.results[0]['latency_50th_ms'], 
+                      self.perf.results[0]['latency_99th_ms'], 
+                      self.perf.results[0]['latency_999th_ms'],
+                      self.execution_id)
+
     @cluster(num_nodes=8)
     @matrix(security_protocol=['SSL'], interbroker_security_protocol=['PLAINTEXT'], tls_version=['TLSv1.2', 'TLSv1.3'],
             compression_type=["none", "snappy"], metadata_quorum=[quorum.isolated_kraft])
@@ -204,7 +247,7 @@ class Benchmark(Test):
 
         Return aggregate throughput statistics for both producer and consumer.
 
-        (Under the hood, this runs ProducerPerformance.java, and ConsumerPerformance.java)
+        (This uses rdkafka_performance instead of ProducerPerformance.java and ConsumerPerformance.java)
         """
         client_version = KafkaVersion(client_version)
         broker_version = KafkaVersion(broker_version)
@@ -214,19 +257,58 @@ class Benchmark(Test):
         self.start_kafka(security_protocol, interbroker_security_protocol, broker_version, tls_version)
         num_records = 10 * 1000 * 1000  # 10e6
 
-        self.producer = ProducerPerformanceService(
+        # Add security settings if needed
+        security_settings = configure_security_settings(security_protocol, tls_version)
+        
+        # Prepare producer settings
+        producer_settings = {
+            'request.required.acks': '1',
+            'compression.codec': compression_type,
+            'batch.size': self.batch_size,
+            'queue.buffering.max.kbytes': self.buffer_memory // 1024,  # Convert to KB
+            'queue.buffering.max.messages':1000000, 
+            'queue.buffering.max.ms':0,
+            'message.timeout.ms':120000,            
+        }
+        
+        producer_settings.update(security_settings)
+
+        # Prepare consumer settings
+        consumer_settings = {
+            'auto.offset.reset': 'earliest',
+            'group.id': 'test-consumer-group',            
+            'socket.receive.buffer.bytes': '2097152',  # Align with Java's receive.buffer.bytes
+            'check.crcs': 'false',                     # Align with Java's check.crcs
+            'session.timeout.ms': '45000',             # Align with Java's session.timeout.ms
+            'fetch.wait.max.ms': '500'                 # Align with Java's fetch.max.wait.ms
+        }
+
+        consumer_settings.update(security_settings)
+        
+        self.producer = LibrdKafkaProducerConsumerPerformance(
             self.test_context, 1, self.kafka,
             topic=TOPIC_REP_THREE,
-            num_records=num_records, record_size=DEFAULT_RECORD_SIZE, throughput=-1, version=client_version,
-            settings={
-                'acks': 1,
-                'compression.type': compression_type,
-                'batch.size': self.batch_size,
-                'buffer.memory': self.buffer_memory
-            }
+            num_records=num_records, record_size=DEFAULT_RECORD_SIZE, throughput=-1,
+            mode="producer", version=client_version, settings=producer_settings
         )
-        self.consumer = ConsumerPerformanceService(
-            self.test_context, 1, self.kafka, topic=TOPIC_REP_THREE, messages=num_records)
+        
+        self.consumer = LibrdKafkaProducerConsumerPerformance(
+            self.test_context, 1, self.kafka,
+            topic=TOPIC_REP_THREE,
+            num_records=num_records,
+            mode="consumer", version=client_version, settings=consumer_settings
+        )
+        
+        # Setup librdkafka on all nodes
+        self.logger.info("Setting up librdkafka for producer and consumer")
+        setup_success = setup_librdkafka(nodes=self.producer.nodes + self.consumer.nodes)
+        if not setup_success:
+            raise Exception("Failed to set up librdkafka on some nodes")
+        
+        # Mark both services as already set up
+        self.producer.librdkafka_setup = True
+        self.consumer.librdkafka_setup = True
+        
         Service.run_parallel(self.producer, self.consumer)
 
         data = {
@@ -258,27 +340,56 @@ class Benchmark(Test):
         self.start_kafka(security_protocol, interbroker_security_protocol, broker_version, tls_version)
         num_records = 10 * 1000 * 1000  # 10e6
 
+        # Prepare producer settings
+        producer_settings = {
+            'request.required.acks': '1',
+            'compression.type': compression_type,
+            'batch.size': self.batch_size,            
+            'queue.buffering.max.kbytes': self.buffer_memory // 1024,  # Convert to KB
+            'queue.buffering.max.messages':1000000, 
+            'queue.buffering.max.ms':0,  # Align with Java's linger.ms
+            'message.timeout.ms':120000, # Align with Java's delivery.timeout.ms
+        }
+        
+        # Add security settings if needed
+        security_settings = configure_security_settings(security_protocol, tls_version)
+        producer_settings.update(security_settings)
+
         # seed kafka w/messages
-        self.producer = ProducerPerformanceService(
+        self.producer = LibrdKafkaProducerConsumerPerformance(
             self.test_context, 1, self.kafka,
             topic=TOPIC_REP_THREE,
-            num_records=num_records, record_size=DEFAULT_RECORD_SIZE, throughput=-1, version=client_version,
-            settings={
-                'acks': 1,
-                'compression.type': compression_type,
-                'batch.size': self.batch_size,
-                'buffer.memory': self.buffer_memory
-            }
+            num_records=num_records, record_size=DEFAULT_RECORD_SIZE, throughput=-1,
+            mode="producer", version=client_version, settings=producer_settings
         )
+        
         self.producer.run()
 
+        # Prepare consumer settings
+        consumer_settings = {
+            'auto.offset.reset': 'earliest',
+            'group.id': 'test-consumer-group',
+            'socket.receive.buffer.bytes': '2097152',  # Align with Java's receive.buffer.bytes
+            'check.crcs': 'false',                     # Align with Java's check.crcs
+            'session.timeout.ms': '45000',             # Align with Java's session.timeout.ms
+            'fetch.wait.max.ms': '500'                 # Align with Java's fetch.max.wait.ms
+        }
+
+        # Add security settings if needed
+        consumer_settings.update(security_settings)
+        
         # consume
-        self.consumer = ConsumerPerformanceService(
+        self.consumer = LibrdKafkaProducerConsumerPerformance(
             self.test_context, num_consumers, self.kafka,
-            topic=TOPIC_REP_THREE, messages=num_records)
-        self.consumer.group = "test-consumer-group"
+            topic=TOPIC_REP_THREE,
+            num_records=num_records, record_size=DEFAULT_RECORD_SIZE, throughput=-1,
+            mode="consumer", settings=consumer_settings
+        )
+        
         self.consumer.run()
         return compute_aggregate_throughput(self.consumer, self.execution_id)
 
-    def validate_versions(self, client_version, broker_version):
-        assert client_version <= broker_version, "Client version %s should be <= than broker version %s" (client_version, broker_version)
+
+
+     
+        

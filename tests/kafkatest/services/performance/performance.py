@@ -47,26 +47,45 @@ class PerformanceService(KafkaPathResolverMixin, BackgroundThreadService):
         node.account.ssh("rm -rf -- %s" % self.root, allow_fail=False)
 
 
-def throughput(records_per_sec, mb_per_sec):
+def throughput(records_per_sec, mb_per_sec, records=None, duration_ms=None, execution_id=None):
     """Helper method to ensure uniform representation of throughput data"""
-    return {
+    result = {
         "records_per_sec": records_per_sec,
         "mb_per_sec": mb_per_sec
     }
 
+    if records is not None:
+        result["records"] = records
+    if duration_ms is not None:
+        result["duration_ms"] = duration_ms
+    if execution_id is not None:
+        result["execution_id"] = execution_id
 
-def latency(latency_50th_ms, latency_99th_ms, latency_999th_ms):
+    return result
+
+def latency(latency_50th_ms, latency_99th_ms, latency_999th_ms, execution_id=None):
+    
     """Helper method to ensure uniform representation of latency data"""
-    return {
+    result = {
         "latency_50th_ms": latency_50th_ms,
         "latency_99th_ms": latency_99th_ms,
         "latency_999th_ms": latency_999th_ms
     }
+    if execution_id is not None:
+        result["execution_id"] = execution_id
+    return result
 
 
-def compute_aggregate_throughput(perf):
+def compute_aggregate_throughput(perf, execution_id=None):
     """Helper method for computing throughput after running a performance service."""
     aggregate_rate = sum([r['records_per_sec'] for r in perf.results])
     aggregate_mbps = sum([r['mbps'] for r in perf.results])
+    aggregate_records = sum([r['records'] for r in perf.results])
 
-    return throughput(aggregate_rate, aggregate_mbps)
+    durations = [r.get('duration_ms') for r in perf.results if 'duration_ms' in r]
+    if len(durations) == len(perf.results):
+        duration_ms = max(durations)
+    else:
+        duration_ms = (aggregate_records / aggregate_rate * 1000) if aggregate_rate > 0 else 0    
+    
+    return throughput(aggregate_rate, aggregate_mbps, aggregate_records, duration_ms, execution_id)
